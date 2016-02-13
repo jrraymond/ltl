@@ -1,8 +1,34 @@
-{-# LANGUAGE DeriveFunctor, DeriveFoldable, DeriveTraversable, ScopedTypeVariables, DeriveGeneric, DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns, DeriveFunctor, DeriveFoldable, DeriveTraversable, ScopedTypeVariables, DeriveGeneric, DeriveDataTypeable, GeneralizedNewtypeDeriving #-}
 module LTP where
 
 import Data.Data
+import Data.List (find)
+import Data.Set (Set)
+import qualified Data.Set as S
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IM
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IS
+import Control.Monad.Trans.State.Strict
+import Control.Monad.Trans.Class
+import Control.Monad.IO.Class
 import GHC.Generics
+import Data.Graph.Inductive.PatriciaTree
+
+newtype FreshNodeT m a = FNT { extractFNTState :: StateT Int m a } deriving (Typeable, Generic, Functor, Applicative, Monad, MonadTrans, MonadIO)
+
+{-
+- Specification is toplevel conjuction of formulae
+- we want to check if a system satisfies the Specification
+- To do this we build a Buchi automoton of the system and a Buchi automoton
+- of the Specification and check if the intersection is empty.
+-
+- What does it mean for a formula in LTL to be valid?
+- We construct Buchi Automoton from Formula, take its complement, then
+- check if complement is empty.
+- 
+-
+-}
 
 
 data Formula a = 
@@ -99,9 +125,113 @@ nnf f =
         DsRelease f1 f2 -> NnfUntil (nnf (DsNeg f1)) (nnf (DsNeg f2))
 
 
+runFreshNode :: Monad m => FreshNodeT m a -> m a
+runFreshNode (FNT f) = evalStateT f 0
+
+getNewId :: Monad m => FreshNodeT m Int
+getNewId = FNT $ do s <- get
+                    put (s + 1)
+                    return s
+
+data ExpandParams a = 
+  EP { epNodes :: IntSet
+     , epIncoming :: IntMap IntSet
+     , epNow :: IntMap (Set (NNF a))
+     , epNext :: IntMap (Set (NNF a)) }
+     deriving (Show, Eq)
+
+curr1 :: Ord a => NNF a -> Set (NNF a)
+curr1 f = 
+  case f of
+    NnfUntil f1 _ -> S.singleton f1
+    NnfRelease _ f2 -> S.singleton f2
+    NnfDisj _ f2 -> S.singleton f2
+    _ -> error "curr1 goofed"
+
+next1 :: Ord a => NNF a -> Set (NNF a)
+next1 f =
+  case f of
+    NnfUntil _ _ -> S.singleton f
+    NnfRelease _ _ -> S.singleton f
+    NnfDisj _ _ -> S.empty
+    _ -> error "next1 goofed"
+
+curr2 :: Ord a => NNF a -> Set (NNF a)
+curr2 f = 
+  case f of
+    NnfUntil _ f2 -> S.singleton f2
+    NnfRelease f1 f2 -> S.fromList [f1, f2]
+    NnfDisj f1 _ -> S.singleton f1
+    _ -> error "curr2 goofed"
+
+expand :: Ord a =>
+          Set (NNF a)              -- current formulas
+        -> Set (NNF a)              -- old formulas
+        -> Set (NNF a)              -- next formulas
+        -> IntSet                   -- incoming edges
+        -> FreshNodeT (State (ExpandParams a)) ()
+expand !curr !old !next !incoming
+  | S.empty == curr = do
+      ep <- lift get 
+      ls <- return $ find 
+           (\nid -> IM.lookup nid (epNext ep) == Just next 
+                      && IM.lookup nid (epNow ep) == Just old)
+           (IS.toList $ epNodes ep)
+      case ls of
+        (Just nid) -> do
+          epincoming' <- return $ IM.insertWith IS.union nid incoming (epIncoming ep)
+          lift (put (ep {epIncoming = epincoming'} ))
+        Nothing -> do
+          nid <- getNewId
+          epNodes' <- return $ IS.insert nid (epNodes ep)
+          epIncoming' <- return $ IM.insert nid incoming (epIncoming ep)
+          epNow' <- return $ IM.insert nid old (epNow ep)
+          epNext' <- return $ IM.insert nid next (epNext ep)
+          lift $ put (ep { epNodes = epNodes', epIncoming = epIncoming', epNow = epNow', epNext = epNext'})
+  | otherwise = do
+      f <- return $ S.elemAt 0 curr
+      curr' <- return $ S.deleteAt 0 curr
+      old' <- return $ S.insert f old
+      case f of
+        NnfTruth -> expand curr' old' next incoming
+        NnfFalsehood -> return ()
+        NnfVar a | S.member (NnfNegVar a) old' -> return ()
+        NnfNegVar a | S.member (NnfVar a) old' -> return ()
+        NnfConj f1 f2 -> do
+          curr'' <- return $ S.union curr' (S.fromList [f1,f2] `S.difference` old')
+          expand curr'' old' next incoming
+        NnfNext f1 -> expand curr' old' (S.union next (S.singleton f1)) incoming
+        NnfDisj _ _ -> undefined
+        _ -> undefined
+        {-
+    where
+      expand_h f1 f2 curr old next incoming = do
+        expand (IS.union curr (IS.difference (S.singleton f1) old) old (IS.union next (IS.singleton 
+        -}
+
+
+
+                            
+
+
+
+
+
+
+
+
+
+
+
+
+
 sugared :: Formula String
 sugared = Always (Implies (Var "Alive")
                           (Eventually (Neg (Var "Alive"))))
 
 desugared :: DSFormula String
 desugared = desugarFormula sugared
+
+
+spec :: Formula String
+spec = undefined
