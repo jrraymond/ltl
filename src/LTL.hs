@@ -9,6 +9,7 @@ import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
+import Data.Maybe (mapMaybe, catMaybes, fromMaybe)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class
 import Control.Monad.IO.Class
@@ -125,6 +126,19 @@ nnf f =
         DsUntil f1 f2 -> NnfRelease (nnf (DsNeg f1)) (nnf (DsNeg f2))
         DsRelease f1 f2 -> NnfUntil (nnf (DsNeg f1)) (nnf (DsNeg f2))
 
+negateNNF :: NNF a -> NNF a
+negateNNF p =
+  case p of
+    NnfVar a -> NnfNegVar a
+    NnfNegVar a -> NnfVar a
+    NnfTruth -> NnfFalsehood
+    NnfFalsehood -> NnfTruth
+    NnfNext p1 -> NnfNext (negateNNF p1)
+    NnfConj p1 p2 -> NnfDisj (negateNNF p1) (negateNNF p2)
+    NnfDisj p1 p2 -> NnfConj (negateNNF p1) (negateNNF p2)
+    NnfUntil p1 p2 -> NnfRelease (negateNNF p1) (negateNNF p2)
+    NnfRelease p1 p2 -> NnfUntil (negateNNF p1) (negateNNF p2)
+
 
 runFreshNode :: Monad m => FreshNodeT m a -> m a
 runFreshNode (FNT f) = evalStateT f 0
@@ -212,37 +226,68 @@ expand !curr !old !next !incoming
             expand (S.union cur (S.difference (curr1 f) ol)) ol (S.union nxt (next1 f)) incm >>
             expand (S.union cur (S.difference (curr2 f) ol)) ol nxt incm
 
+initSymbol :: Int
+initSymbol = (-1)
+
 createGraph :: Ord a => Formula a -> (IntSet, IntMap IntSet, IntMap (Set (NNF a)))
 createGraph f = (epNodes ep, epIncoming ep, epNow ep)
   where
     curr = S.singleton (nnf (desugarFormula f))
     old = S.empty
     next = S.empty
-    incoming = IS.singleton (-1)
+    incoming = IS.singleton initSymbol
     ep0 = EP IS.empty IM.empty IM.empty IM.empty
     ep = execState (evalStateT (extractFNTState (expand curr old next incoming)) 0) ep0
 
 data LGBA a =
   LGBA { lgbaStates :: IntSet
-       , lgbaAlphabet :: Set a
-       , lgbaLabel :: IntMap a
+       , lgbaAlphabet :: Set (NNF a)
+       , lgbaLabel :: IntMap (Set (NNF a))
        , lgbaTransition :: IntMap Int
        , lgbaInit :: IntSet
-       , lgbaFinal :: IntSet }
+       , lgbaFinal :: Set IntSet }
   deriving (Show, Eq)
 
-{-
-constructLGBA :: Set a -> IntSet -> IntMap IntSet -> IntMap (Set (NNF a)) -> LGBA a
-constructLGBA ap nodes now incoming = lgba
+isUntil :: NNF a -> Bool
+isUntil (NnfUntil _ _) = True
+isUntil _ = False
+
+closureUnderNeg = undefined
+
+{- A Labeled Generalized Buchi Automaton is a GBA where
+- input is associated as labels with the states rather than
+- with the transitions -}
+constructLGBA :: Ord a =>
+    Formula a
+    -> Set (NNF a)            --atomic propositions
+    -> IntSet                 --nodes
+    -> IntMap IntSet          --incoming
+    -> IntMap (Set (NNF a))   --now
+    -> LGBA a
+constructLGBA formula ap nodes incoming now = lgba
   where
-    lables = IM.fromList (map
-                         (\q ->
-                            let p = S.toList ap
-                                qs = IM.lookup q now
-                                ps = filter (\p -> NnfNegVar p `IS.member` qs)
-                            in (q, qs, IM.lookup q now)
-                         (IS.toList nodes)
--}
+    lgba = LGBA nodes ap lbls transitions initial final
+    nodeLst = IS.toList nodes
+    initial = IS.fromList [ q | q <- nodeLst
+                           , fromMaybe False (IS.member initSymbol <$> IM.lookup q incoming) ]
+    final = S.singleton $ IS.fromList
+            [ q | q <- nodeLst
+                , let clf = closureUnderNeg formula
+                , NnfUntil f1 f2 <- filter isUntil clf
+                , let ns = IM.lookup q now
+                , Just True == ((||) <$> (S.member f2 <$> ns) <*> (S.member (NnfUntil f1 f2) <$> ns)) ]
+    lbls = IM.fromList (mapMaybe labels nodeLst)
+    labels q 
+      | ps `S.isSubsetOf` qs = Just (q, ps)
+      | otherwise = Nothing
+      where
+        qs = S.intersection ap (IM.findWithDefault S.empty q now)
+        ps = S.fromList [ p | p <- S.toList ap
+                             , not (S.member (negateNNF p) qs) ]
+    transitions = IM.fromList [ (q, q') | q' <- nodeLst
+                                        , q <- fromMaybe [] (IS.toList <$> IM.lookup q' incoming)]
+
+
 
 
 sugared :: Formula String
