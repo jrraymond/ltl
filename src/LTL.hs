@@ -1,5 +1,5 @@
 {-# LANGUAGE BangPatterns, DeriveFunctor, DeriveFoldable, DeriveTraversable, ScopedTypeVariables, DeriveGeneric, DeriveDataTypeable, GeneralizedNewtypeDeriving #-}
-module LTP where
+module LTL where
 
 import Data.Data
 import Data.List (find)
@@ -15,8 +15,6 @@ import Control.Monad.IO.Class
 import GHC.Generics
 import Data.Graph.Inductive.PatriciaTree
 
-newtype FreshNodeT m a = FNT { extractFNTState :: StateT Int m a } deriving (Typeable, Generic, Functor, Applicative, Monad, MonadTrans, MonadIO)
-
 {-
 - Specification is toplevel conjuction of formulae
 - we want to check if a system satisfies the Specification
@@ -30,11 +28,14 @@ newtype FreshNodeT m a = FNT { extractFNTState :: StateT Int m a } deriving (Typ
 -
 -}
 
+newtype FreshNodeT m a = FNT { extractFNTState :: StateT Int m a }
+  deriving (Typeable, Generic, Functor, Applicative, Monad, MonadTrans, MonadIO)
+
 
 data Formula a = 
     Var a
-  | Truth                             -- true
-  | Falsehood                          -- false
+  | Truth                           -- true
+  | Falsehood                       -- false
   | Neg (Formula a)
   | Next (Formula a)
   | Always (Formula a)              -- aka globally
@@ -54,33 +55,33 @@ data Formula a =
 
 data DSFormula a = 
     DsVar a
-  | DsTruth                             -- true
-  | DsFalsehood                          -- false
+  | DsTruth                               -- true
+  | DsFalsehood                           -- false
   | DsNeg (DSFormula a)
   | DsNext (DSFormula a)
   | DsConj (DSFormula a) (DSFormula a)    -- and
   | DsDisj (DSFormula a) (DSFormula a)    -- or
   | DsUntil (DSFormula a) (DSFormula a)   -- f1 is true at least until f2 is true,
-                                      -- and f2 is true currently or in future
+                                          -- and f2 is true currently or in future
   | DsRelease (DSFormula a) (DSFormula a) -- f2 is true until and including when 
-                                    -- f1 first becomes true, if f1 never 
-                                    -- becomes true, f2 must remain true forever
+                                          -- f1 first becomes true, if f1 never 
+                                          -- becomes true, f2 must remain true forever
   deriving (Show, Eq, Ord, Read, Functor, Data, Typeable, Generic, Foldable, Traversable)
 
 
 data NNF a = 
     NnfVar a
   | NnfNegVar a
-  | NnfTruth                             -- true
-  | NnfFalsehood                          -- false
+  | NnfTruth                   -- true
+  | NnfFalsehood               -- false
   | NnfNext (NNF a)
   | NnfConj (NNF a) (NNF a)    -- and
   | NnfDisj (NNF a) (NNF a)    -- or
   | NnfUntil (NNF a) (NNF a)   -- f1 is true at least until f2 is true,
-                                       -- and f2 is true currently or in future
+                               -- and f2 is true currently or in future
   | NnfRelease (NNF a) (NNF a) -- f2 is true until and including when 
-                                    -- f1 first becomes true, if f1 never 
-                                    -- becomes true, f2 must remain true forever
+                               -- f1 first becomes true, if f1 never 
+                               -- becomes true, f2 must remain true forever
   deriving (Show, Eq, Ord, Read, Functor, Data, Typeable, Generic, Foldable, Traversable)
 
 
@@ -165,7 +166,7 @@ curr2 f =
     _ -> error "curr2 goofed"
 
 expand :: Ord a =>
-          Set (NNF a)              -- current formulas
+          Set (NNF a)               -- current formulas
         -> Set (NNF a)              -- old formulas
         -> Set (NNF a)              -- next formulas
         -> IntSet                   -- incoming edges
@@ -196,33 +197,52 @@ expand !curr !old !next !incoming
         NnfTruth -> expand curr' old' next incoming
         NnfFalsehood -> return ()
         NnfVar a | S.member (NnfNegVar a) old' -> return ()
+                 | otherwise -> expand curr' old' next incoming
         NnfNegVar a | S.member (NnfVar a) old' -> return ()
+                    | otherwise -> expand curr' old' next incoming
         NnfConj f1 f2 -> do
           curr'' <- return $ S.union curr' (S.fromList [f1,f2] `S.difference` old')
           expand curr'' old' next incoming
         NnfNext f1 -> expand curr' old' (S.union next (S.singleton f1)) incoming
-        NnfDisj _ _ -> undefined
-        _ -> undefined
-        {-
-    where
-      expand_h f1 f2 curr old next incoming = do
-        expand (IS.union curr (IS.difference (S.singleton f1) old) old (IS.union next (IS.singleton 
-        -}
+        NnfDisj _ _ -> expand_h f curr' old' next incoming
+        NnfUntil _ _ -> expand_h f curr' old' next incoming
+        NnfRelease _ _ -> expand_h f curr' old' next incoming
+        where
+          expand_h f cur ol nxt incm =
+            expand (S.union cur (S.difference (curr1 f) ol)) ol (S.union nxt (next1 f)) incm >>
+            expand (S.union cur (S.difference (curr2 f) ol)) ol nxt incm
 
+createGraph :: Ord a => Formula a -> (IntSet, IntMap IntSet, IntMap (Set (NNF a)))
+createGraph f = (epNodes ep, epIncoming ep, epNow ep)
+  where
+    curr = S.singleton (nnf (desugarFormula f))
+    old = S.empty
+    next = S.empty
+    incoming = IS.singleton (-1)
+    ep0 = EP IS.empty IM.empty IM.empty IM.empty
+    ep = execState (evalStateT (extractFNTState (expand curr old next incoming)) 0) ep0
 
+data LGBA a =
+  LGBA { lgbaStates :: IntSet
+       , lgbaAlphabet :: Set a
+       , lgbaLabel :: IntMap a
+       , lgbaTransition :: IntMap Int
+       , lgbaInit :: IntSet
+       , lgbaFinal :: IntSet }
+  deriving (Show, Eq)
 
-                            
-
-
-
-
-
-
-
-
-
-
-
+{-
+constructLGBA :: Set a -> IntSet -> IntMap IntSet -> IntMap (Set (NNF a)) -> LGBA a
+constructLGBA ap nodes now incoming = lgba
+  where
+    lables = IM.fromList (map
+                         (\q ->
+                            let p = S.toList ap
+                                qs = IM.lookup q now
+                                ps = filter (\p -> NnfNegVar p `IS.member` qs)
+                            in (q, qs, IM.lookup q now)
+                         (IS.toList nodes)
+-}
 
 
 sugared :: Formula String

@@ -1,4 +1,4 @@
-import LTP
+import LTL
 
 
 main :: IO ()
