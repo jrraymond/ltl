@@ -2,19 +2,23 @@
 module LTL where
 
 import Data.Data
-import Data.List (find)
-import Data.Set (Set)
-import qualified Data.Set as S
+import GHC.Generics
+import Data.Graph (Graph)
+import qualified Data.Graph as G
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
-import Data.Maybe (mapMaybe, catMaybes, fromMaybe)
+import Data.List (find, intersect)
+import Data.Maybe (mapMaybe, fromMaybe)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Trans.Class
 import Control.Monad.IO.Class
-import GHC.Generics
-import Data.Graph.Inductive.PatriciaTree
+import Data.Set (Set)
+import qualified Data.Set as S
+import Data.Tree (Tree)
+import qualified Data.Tree as T (flatten)
+
 
 {-
 - Specification is toplevel conjuction of formulae
@@ -26,6 +30,13 @@ import Data.Graph.Inductive.PatriciaTree
 - We construct Buchi Automoton from Formula, take its complement, then
 - check if complement is empty.
 - 
+- The algorithm we use for translating LTL formulae to Buchi Automaton is
+- from Gerth et al "Simple On-The-Fly Automatic Verification of Linear
+- Temporal Logic".
+- For a more detailed explanation of the algorithm see Theorem Proving in
+- Higher Order Logics, 22nd International Conference.
+- More refences:
+- https://en.wikipedia.org/wiki/Linear_temporal_logic_to_B%C3%BCchi_automaton
 -
 -}
 
@@ -141,13 +152,21 @@ negateNNF p =
 
 
 runFreshNode :: Monad m => FreshNodeT m a -> m a
-runFreshNode (FNT f) = evalStateT f 0
+runFreshNode (FNT f) = evalStateT f (initSymbol + 1)
 
 getNewId :: Monad m => FreshNodeT m Int
 getNewId = FNT $ do s <- get
                     put (s + 1)
                     return s
 
+{-
+- nodes: the names of all the nodes in the graph
+- incoming: the set of nodes that have an edge pointing to the current node
+- now: LTL formulae promised by this node but that have not yet
+- been processed
+- old: LTL formulae promised by this node that have already been processed
+- next: set of LTL formulae that all successor nodes must promise
+-}
 data ExpandParams a = 
   EP { epNodes :: IntSet
      , epIncoming :: IntMap IntSet
@@ -180,7 +199,7 @@ curr2 f =
     _ -> error "curr2 goofed"
 
 expand :: Ord a =>
-          Set (NNF a)               -- current formulas
+           Set (NNF a)              -- current formulas
         -> Set (NNF a)              -- old formulas
         -> Set (NNF a)              -- next formulas
         -> IntSet                   -- incoming edges
@@ -227,7 +246,7 @@ expand !curr !old !next !incoming
             expand (S.union cur (S.difference (curr2 f) ol)) ol nxt incm
 
 initSymbol :: Int
-initSymbol = (-1)
+initSymbol = 0
 
 createGraph :: Ord a => Formula a -> (IntSet, IntMap IntSet, IntMap (Set (NNF a)))
 createGraph f = (epNodes ep, epIncoming ep, epNow ep)
@@ -237,28 +256,78 @@ createGraph f = (epNodes ep, epIncoming ep, epNow ep)
     next = S.empty
     incoming = IS.singleton initSymbol
     ep0 = EP IS.empty IM.empty IM.empty IM.empty
-    ep = execState (evalStateT (extractFNTState (expand curr old next incoming)) 0) ep0
+    ep = execState (evalStateT (extractFNTState (expand curr old next incoming)) (initSymbol + 1)) ep0
+
+
+{- A generalized Buchi automaton (GBA) consists of
+-     Q             - a finite set of states
+-     I \subset Q   - a set of initial states
+-     G \subset QxQ - a transition relation
+-     F \subset 2^Q - the set of acceptance sets
+-   An omega-word sigma over Q is a _path_ of the GBA if sigma_o \in I and
+-     (sigma_i, sigma_{i+1}) \in G \forall i \in N
+-   limit(sigma) := {q | exists n. sigma_n = q}
+-   The GBA accepts a path if limit(sigma) \intersection M \neq {} holds
+-   for all M in F
+-
+-   A labelled generalized Buchi automaton (LGBA) is 
+-     A = (Q, I, G, F) a GBA
+-     D a finite set of labels
+-     L : Q -> 2^D the label function
+- 
+-   A path sigma of A is _consistent_ with an omega-word Epsilon over D if
+-   Epsilon_i \in L(sigma_i) for all i \in N.
+-   An LGBA accepts an omega-word Epsilon over D iff it accepts some path
+-   of A that is consistent with Epsilon
+-
+-
+-}
+data GBA a =
+  GBA { gbaStates :: IntSet
+      , gbaInit :: IntSet
+      , gbaTransition :: IntMap Int
+      , gbaFinal :: Set IntSet }
+      deriving (Eq, Read, Show)
 
 data LGBA a =
-  LGBA { lgbaStates :: IntSet
-       , lgbaAlphabet :: Set (NNF a)
-       , lgbaLabel :: IntMap (Set (NNF a))
-       , lgbaTransition :: IntMap Int
-       , lgbaInit :: IntSet
-       , lgbaFinal :: Set IntSet }
-  deriving (Show, Eq)
+  LGBA { lgbaGBA :: GBA a
+       , lgbaLabel :: IntMap (Set (NNF a)) }
+       deriving (Show, Eq)
+
 
 isUntil :: NNF a -> Bool
 isUntil (NnfUntil _ _) = True
 isUntil _ = False
 
-closureUnderNeg = undefined
+
+{- See wiki page on LTL to BA for formal specification -}
+closureUnderNeg :: (Show a, Ord a) => NNF a -> Set (NNF a)
+closureUnderNeg f0 = S.union (go False f0) (S.fromList [NnfTruth, NnfFalsehood])
+  where
+    go !negated !f
+      | not negated = S.union (go True negf) (S.insert f cl)
+      | otherwise = S.insert f cl
+      where
+        negf = negateNNF f
+        cl = case f of
+               NnfTruth -> S.empty
+               NnfFalsehood -> S.empty
+               NnfVar _ -> S.empty
+               NnfNegVar _ -> S.empty
+               NnfConj f1 f2 -> S.union (go False f1) (go False f2)
+               NnfDisj f1 f2 -> S.union (go False f1) (go False f2 )
+               NnfUntil f1 f2 -> S.union (go False f1) (go False f2)
+               NnfRelease f1 f2 -> S.union (go False f1) (go False f2)
+               NnfNext f1 -> go False f1
+
+
+
 
 {- A Labeled Generalized Buchi Automaton is a GBA where
 - input is associated as labels with the states rather than
 - with the transitions -}
-constructLGBA :: Ord a =>
-    Formula a
+constructLGBA :: (Show a, Ord a) =>
+       Formula a
     -> Set (NNF a)            --atomic propositions
     -> IntSet                 --nodes
     -> IntMap IntSet          --incoming
@@ -266,13 +335,14 @@ constructLGBA :: Ord a =>
     -> LGBA a
 constructLGBA formula ap nodes incoming now = lgba
   where
-    lgba = LGBA nodes ap lbls transitions initial final
+    gba = GBA nodes initial transitions final
+    lgba = LGBA gba lbls
     nodeLst = IS.toList nodes
     initial = IS.fromList [ q | q <- nodeLst
-                           , fromMaybe False (IS.member initSymbol <$> IM.lookup q incoming) ]
+                          , fromMaybe False (IS.member initSymbol <$> IM.lookup q incoming) ]
     final = S.singleton $ IS.fromList
             [ q | q <- nodeLst
-                , let clf = closureUnderNeg formula
+                , let clf = S.toList (closureUnderNeg (nnf (desugarFormula formula)))
                 , NnfUntil f1 f2 <- filter isUntil clf
                 , let ns = IM.lookup q now
                 , Just True == ((||) <$> (S.member f2 <$> ns) <*> (S.member (NnfUntil f1 f2) <$> ns)) ]
@@ -288,8 +358,35 @@ constructLGBA formula ap nodes incoming now = lgba
                                         , q <- fromMaybe [] (IS.toList <$> IM.lookup q' incoming)]
 
 
+{- Checks if an LTL forumula is valid, ie it is true under all possible
+- interpretations. We construct a graph of the negation of the formula, and
+- if it is empty then the formula is valid.
+- A BA is empty if and only if there is a final state reachabel from an
+- initial state and lies on a cycle. We do this by decomposing the graph
+- into strongly connected components. Run a depth first search to find
+- which strongly connected components are reachable from the intial states.
+- If any of the strongly connected components are reachable, the BA is
+- non-empty.
+-}
+isValid :: (Show a, Ord a) => Formula a -> Bool
+isValid f = not (any (\c -> length c > 1 && not (null (reachable `intersect` c))) sccs)
+  where
+    sccs = map T.flatten (G.scc g)
+    !reachable = G.reachable g initSymbol
+    (nodes, incoming, _) = createGraph (Neg f)
+    outgoing = buildOutgoing (IM.toList incoming) IM.empty
+    (g, _, _) = G.graphFromEdges $ map (\n -> (n, n, lkpFun n)) (initSymbol:IS.toList nodes)
+    lkpFun = IS.toList . fromMaybe IS.empty . flip IM.lookup outgoing
+    buildOutgoing ins outs = 
+      case ins of
+        [] -> outs
+        (n, incm):ins' ->
+          let alterFun x out = Just (IS.insert x (fromMaybe IS.empty out))
+              outs' = IS.foldl' (flip (IM.alter (alterFun n))) outs incm
+          in buildOutgoing ins' outs'
 
 
+{- -------------------- TESTS -------------------- -}
 sugared :: Formula String
 sugared = Always (Implies (Var "Alive")
                           (Eventually (Neg (Var "Alive"))))
@@ -298,5 +395,10 @@ desugared :: DSFormula String
 desugared = desugarFormula sugared
 
 
-spec :: Formula String
-spec = undefined
+data AP = A | B | C | D deriving (Eq, Read, Show, Ord)
+
+spec :: Formula AP
+spec = Implies (Conj (Var A) (Var B)) (Disj (Var A) (Var B))
+
+specBad :: Formula AP
+specBad = Implies (Disj (Var A) (Var B)) (Conj (Var A) (Var B))
