@@ -19,6 +19,7 @@ import qualified Data.Set as S
 import Data.Tree (Tree)
 import qualified Data.Tree as T (flatten)
 
+import Debug.Trace
 
 {-
 - Specification is toplevel conjuction of formulae
@@ -27,8 +28,7 @@ import qualified Data.Tree as T (flatten)
 - of the Specification and check if the intersection is empty.
 -
 - What does it mean for a formula in LTL to be valid?
-- We construct Buchi Automoton from Formula, take its complement, then
-- check if complement is empty.
+- For any interpretation, the formula is true.
 - 
 - The algorithm we use for translating LTL formulae to Buchi Automaton is
 - from Gerth et al "Simple On-The-Fly Automatic Verification of Linear
@@ -369,10 +369,10 @@ constructLGBA formula ap nodes incoming now = lgba
 - non-empty.
 -}
 isValid :: (Show a, Ord a) => Formula a -> Bool
-isValid f = not (any (\c -> length c > 1 && not (null (reachable `intersect` c))) sccs)
+isValid f = not (any (\c -> c /= [initSymbol] && not (null (reachable `intersect` c))) sccs)
   where
     sccs = map T.flatten (G.scc g)
-    !reachable = G.reachable g initSymbol
+    !reachable = traceShow (outgoing, g, G.reachable g initSymbol, sccs) $ G.reachable g initSymbol
     (nodes, incoming, _) = createGraph (Neg f)
     outgoing = buildOutgoing (IM.toList incoming) IM.empty
     (g, _, _) = G.graphFromEdges $ map (\n -> (n, n, lkpFun n)) (initSymbol:IS.toList nodes)
